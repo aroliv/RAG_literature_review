@@ -183,25 +183,44 @@ def build_citation(ch: Chunk) -> str:
     return f"[{base}:{ch.page_start+1}]"
 
 def make_prompt(theme: str, selected: List[Chunk]) -> str:
-    """Prompt estruturado que força citações e seções."""
-    context_blocks = [f"{build_citation(ch)}\n{ch.text}" for ch in selected]
+    """
+    Gera um prompt para que o modelo construa uma revisão teórica
+    acadêmica a partir dos trechos dos PDFs enviados.
+    O objetivo é identificar a ideia central e a contribuição teórica
+    de cada autor citado, sintetizando-as de modo coerente e crítico,
+    com referências formatadas em estilo APA.
+    """
+    context_blocks = []
+    for ch in selected:
+        context_blocks.append(f"{build_citation(ch)}\n{ch.text}")
     context = "\n\n".join(context_blocks)
+
     return (
-        "Você é um assistente de revisão sistemática em marketing/gestão/consumo.\n"
-        "Responda APENAS com base nos trechos fornecidos; se faltar evidência, diga 'não há suporte nos trechos'.\n"
-        "Use seções com títulos claros e bullets quando útil.\n"
-        "Inclua citações no formato [doc:pag].\n\n"
-        f"TEMA / PERGUNTA DE PESQUISA: {theme}\n\n"
-        "TRECHOS (com citações):\n"
+        "Você é um pesquisador sênior em ciências sociais e comportamento do consumidor.\n"
+        "Com base APENAS nos trechos abaixo, escreva uma REVISÃO TEÓRICA (referencial de literatura) "
+        "coerente, crítica e acadêmica, no estilo de artigos de alto impacto (ex.: Journal of Consumer Research, "
+        "Journal of Marketing Research, ou Organization Science).\n\n"
+        "Siga estas instruções:\n"
+        "1. Identifique a **ideia central, argumento ou contribuição teórica** de cada autor.\n"
+        "2. Organize as ideias por **correntes teóricas, convergências e divergências**.\n"
+        "3. Sintetize o que se sabe, o que é debatido e o que ainda é incerto.\n"
+        "4. Use linguagem formal e impessoal, com coesão e conectores acadêmicos (por exemplo: 'de acordo com', "
+        "'em contraposição a', 'por outro lado', 'em consonância com').\n"
+        "5. Cite explicitamente os autores e anos conforme **formato APA** (Autor, Ano) e, ao final, "
+        "gere uma lista de referências fictícia mas plausível, em formato APA.\n"
+        "6. Termine com um parágrafo de síntese teórica, destacando lacunas e oportunidades de pesquisa.\n\n"
+        f"TEMA DE PESQUISA: {theme}\n\n"
+        "=== TRECHOS FORNECIDOS ===\n"
         f"{context}\n\n"
-        "GERAR (em português):\n"
-        "# 1. Contexto e definições\n"
-        "# 2. Métodos predominantes (amostras, delineamentos)\n"
-        "# 3. Achados-chave (com bullets e citações)\n"
-        "# 4. Lacunas e controvérsias\n"
-        "# 5. Agenda de pesquisa (3–7 proposições testáveis)\n"
-        "# 6. Limitações do corpus analisado (baseado nos trechos)\n"
+        "=== PRODUZIR ===\n"
+        "Um texto fluido, em português acadêmico, com cerca de 600–1500 palavras, estruturado nas seções:\n"
+        "1. Introdução ao tema e relevância teórica\n"
+        "2. Principais abordagens e contribuições dos autores (com citações APA)\n"
+        "3. Síntese e comparação entre perspectivas\n"
+        "4. Lacunas e agenda de pesquisa futura\n"
+        "5. Referências (em formato APA)\n"
     )
+
 
 def extractive_review(theme: str, selected: List[Chunk]) -> str:
     """Fallback sem LLM: apenas concatena trechos + citações."""
