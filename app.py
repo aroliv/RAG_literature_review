@@ -1,4 +1,4 @@
-# app.py — RAG para Revisão Bibliográfica com Streamlit + FAISS + Sentence-Transformers + Gemini
+# app.py — RAG para Revisão Bibliográfica (Streamlit + FAISS + Sentence-Transformers + OpenAI/Gemini)
 # Execução: streamlit run app.py
 
 from __future__ import annotations
@@ -6,14 +6,22 @@ import os
 import io
 import re
 from dataclasses import dataclass
-from typing import List, Dict, Tuple
+from typing import List, Dict, Tuple, Optional
 
 import streamlit as st
 import fitz  # PyMuPDF
 from sentence_transformers import SentenceTransformer
 import faiss
 
-# ====== Gemini (opcional) ======
+# ====== OpenAI (principal) ======
+USE_OPENAI = False
+try:
+    from openai import OpenAI  # pip install openai>=1.40.0
+    USE_OPENAI = True
+except Exception:
+    USE_OPENAI = False
+
+# ====== Gemini (opcional / fallback) ======
 USE_GEMINI = False
 try:
     import google.generativeai as genai  # pip install google-generativeai>=0.7.2
@@ -29,7 +37,6 @@ except Exception:
     HAS_DOCX = False
 
 DEFAULT_EMB = os.getenv("EMBEDDING_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
-GEMINI_MIN_VERSION = "0.7.2"  # recomendado
 
 # =========================
 # Utilitários de dados
@@ -115,7 +122,7 @@ class VectorIndex:
     def __init__(self, model_name: str = DEFAULT_EMB):
         self.model_name = model_name
         self.emb_model = SentenceTransformer(model_name)
-        self.index: faiss.Index | None = None
+        self.index: Optional[faiss.Index] = None
         self.vectors = None
         self.meta: List[Chunk] = []
 
@@ -197,7 +204,7 @@ def make_prompt(theme: str, selected: List[Chunk]) -> str:
     )
 
 def extractive_review(theme: str, selected: List[Chunk]) -> str:
-    """Fallback sem LLM: apenas concatena os trechos mais relevantes com citações."""
+    """Fallback sem LLM: apenas concatena trechos + citações."""
     lines = [f"## Revisão (extrativa) — {theme}"]
     for ch in selected:
         lines.append(f"- {ch.text.strip()} {build_citation(ch)}")
@@ -233,11 +240,30 @@ def to_docx(theme: str, body_md: str) -> bytes:
     return bio.getvalue()
 
 # =========================
-# Gemini helpers (patch)
+# Provedores LLM
 # =========================
 
+def call_openai(prompt: str, model_name: str = "gpt-4o-mini") -> str:
+    """
+    Gera conteúdo via OpenAI Chat Completions (model configurable).
+    Você pode definir OPENAI_MODEL="gpt-5" se sua conta tiver acesso.
+    """
+    client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+    try:
+        resp = client.chat.completions.create(
+            model=model_name,
+            messages=[
+                {"role": "system", "content": "Você é um assistente especializado em revisão bibliográfica acadêmica. Responda apenas com base nos trechos fornecidos (RAG)."},
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0.4,
+        )
+        return resp.choices[0].message.content
+    except Exception as e:
+        st.error(f"Erro ao chamar o modelo OpenAI: {e}")
+        return "Falha ao gerar revisão com OpenAI."
+
 def _configure_gemini(api_key: str | None) -> bool:
-    """Configura a SDK do Gemini se a chave existir."""
     if not api_key:
         return False
     try:
@@ -248,12 +274,10 @@ def _configure_gemini(api_key: str | None) -> bool:
         return False
 
 def _list_gemini_models() -> list[str]:
-    """Lista modelos com generateContent, quando possível (útil p/ debug)."""
     try:
         models = genai.list_models()
         names = []
         for m in models:
-            # algumas versões expõem supported_generation_methods
             if hasattr(m, "supported_generation_methods") and "generateContent" in m.supported_generation_methods:
                 names.append(getattr(m, "name", None))
         return [n for n in names if n]
@@ -261,42 +285,22 @@ def _list_gemini_models() -> list[str]:
         return []
 
 def _resolve_model_name(requested: str) -> str:
-    """
-    Resolve nome do modelo (com/sem prefixo 'models/') e aplica fallback.
-    """
     available = _list_gemini_models()
     if not available:
-        # Não conseguimos listar — tente como veio
         return requested
-
-    # match direto
     if requested in available:
         return requested
-
-    # tentar com prefixo
     prefixed = f"models/{requested}"
     if prefixed in available:
         return prefixed
-
-    # se veio prefixado, tentar sem
     if requested.startswith("models/") and requested[7:] in available:
         return requested[7:]
-
-    # fallbacks comuns
-    for cand in [
-        "gemini-1.5-flash", "models/gemini-1.5-flash",
-        "gemini-1.5-pro",   "models/gemini-1.5-pro",
-    ]:
+    for cand in ["gemini-1.5-flash", "models/gemini-1.5-flash", "gemini-1.5-pro", "models/gemini-1.5-pro"]:
         if cand in available:
             return cand
-
-    # último recurso
     return available[0]
 
 def call_gemini(prompt: str, model_name: str = "gemini-1.5-flash") -> str:
-    """
-    Chama Gemini com resolução de nome de modelo e mensagens de erro úteis.
-    """
     try:
         resolved = _resolve_model_name(model_name)
         model = genai.GenerativeModel(resolved)
@@ -306,15 +310,10 @@ def call_gemini(prompt: str, model_name: str = "gemini-1.5-flash") -> str:
         return "Não foi possível gerar texto com o Gemini nesta tentativa (resposta vazia)."
     except Exception as e:
         st.error(
-            "Falha ao chamar o Gemini. Verifique chave, modelo e versão da biblioteca. "
+            "Falha ao chamar o Gemini. Verifique chave/modelo/versão. "
             f"Detalhes: {e}"
         )
-        st.info(
-            "Dicas: confirme se o modelo existe para sua conta/região, "
-            "tente 'gemini-1.5-flash' ou 'gemini-1.5-pro', e/ou atualize "
-            "`google-generativeai` para >= 0.7.2."
-        )
-        return "Erro ao gerar com Gemini (veja a mensagem acima)."
+        return "Erro ao gerar com Gemini."
 
 # =========================
 # UI — Streamlit
@@ -336,19 +335,25 @@ with st.sidebar:
     per_doc = st.slider("Diversidade por documento (máx. chunks)", 1, 10, 3, step=1)
     max_total = st.slider("Máximo total de chunks no prompt", 5, 30, 12, step=1)
 
-    st.subheader("Gemini")
-    gemini_key = st.text_input("GEMINI_API_KEY", type="password", value=os.getenv("GEMINI_API_KEY", ""))
-    gemini_model = st.selectbox("Modelo", ["gemini-1.5-flash", "gemini-1.5-pro"], index=0)
+    st.subheader("Provedor LLM")
+    provider = st.selectbox("Provedor", ["auto (OpenAI→Gemini→Extrativo)", "OpenAI", "Gemini", "Somente extrativo"], index=0)
 
-    if USE_GEMINI:
-        configured = _configure_gemini(gemini_key)
-        if configured:
-            models = _list_gemini_models()
-            if models:
-                with st.expander("Modelos Gemini disponíveis (debug)"):
-                    st.write(models)
-    else:
-        st.warning("Pacote `google-generativeai` não encontrado. Instale/atualize para usar Gemini.")
+    st.caption("— O app prioriza OpenAI; você pode usar OPENAI_MODEL='gpt-5' se sua conta tiver acesso.")
+
+    st.divider()
+    st.subheader("OpenAI")
+    openai_key = st.text_input("OPENAI_API_KEY", type="password", value=os.getenv("OPENAI_API_KEY", ""))
+    openai_model = st.text_input("OPENAI_MODEL", value=os.getenv("OPENAI_MODEL", "gpt-4o-mini"))
+    if openai_key:
+        os.environ["OPENAI_API_KEY"] = openai_key
+    if openai_model:
+        os.environ["OPENAI_MODEL"] = openai_model
+
+    st.subheader("Gemini (fallback)")
+    gemini_key = st.text_input("GEMINI_API_KEY", type="password", value=os.getenv("GEMINI_API_KEY", ""))
+    gemini_model = st.selectbox("GEMINI_MODEL", ["gemini-1.5-flash", "gemini-1.5-pro"], index=0)
+    if USE_GEMINI and gemini_key:
+        _configure_gemini(gemini_key)
 
 uploaded = st.file_uploader("Envie múltiplos PDFs", type=["pdf"], accept_multiple_files=True)
 
@@ -403,23 +408,32 @@ if run_btn:
             hits = st.session_state.vector.search(theme, k=int(topk))
             selected = diversify_by_doc(hits, per_doc=int(per_doc), max_total=int(max_total))
 
-            # Prévia dos trechos (auditoria/NO TTI)
             with st.expander("Trechos selecionados (para auditoria)"):
                 for ch in selected:
                     st.markdown(f"**{build_citation(ch)} — {ch.title}**")
                     st.write(ch.text)
                     st.divider()
 
-            # Geração
-            if gemini_key and USE_GEMINI:
-                prompt = make_prompt(theme, selected)
+            # Escolha do provedor
+            body_text = ""
+            choice = provider.lower()
+            use_openai = (("openai" in choice and USE_OPENAI and os.getenv("OPENAI_API_KEY"))
+                          or (choice.startswith("auto") and USE_OPENAI and os.getenv("OPENAI_API_KEY")))
+            use_gemini = (("gemini" in choice and USE_GEMINI and gemini_key)
+                          or (choice.startswith("auto") and (not use_openai) and USE_GEMINI and gemini_key))
+
+            prompt = make_prompt(theme, selected)
+
+            if use_openai:
+                model = os.getenv("OPENAI_MODEL", openai_model or "gpt-4o-mini")
+                body_text = call_openai(prompt, model_name=model)
+            elif use_gemini:
                 body_text = call_gemini(prompt, model_name=gemini_model)
             else:
                 body_text = extractive_review(theme, selected)
 
             md = to_markdown(theme, body_text, st.session_state.mapping)
 
-            # Saída
             st.markdown("### Revisão gerada")
             st.write(body_text)
 
@@ -452,3 +466,4 @@ st.markdown(
 - O app mantém tudo em memória; se quiser índice persistente, use `ingest.py`.
 """
 )
+
