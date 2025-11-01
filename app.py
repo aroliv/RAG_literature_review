@@ -6,7 +6,7 @@ import os
 import io
 import re
 from dataclasses import dataclass
-from typing import List, Dict, Tuple, Optional
+from typing import List, Dict, Tuple, Optional, Set
 
 import streamlit as st
 import fitz  # PyMuPDF
@@ -38,7 +38,6 @@ except Exception:
 
 DEFAULT_EMB = os.getenv("EMBEDDING_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
 
-
 # =========================
 # Estruturas e utilitários
 # =========================
@@ -67,16 +66,69 @@ def read_pdf(path_or_bytes: bytes | str) -> Tuple[List[str], str]:
     pages = [p.get_text("text") for p in doc]
     return pages, title
 
-def build_citation(ch: Chunk) -> str:
-    """Gera marcador [arquivo:pag] usado no contexto; no texto, o modelo cita (arquivo:pag)."""
-    base = os.path.splitext(os.path.basename(ch.title))[0]
-    return f"[{base}:{ch.page_start+1}]"
+# ===== Inferência de Label Autor-Ano por PDF =====
 
-def files_used_from_chunks(chunks: List[Chunk]) -> List[str]:
-    """Retorna os nomes-base (sem extensão) dos arquivos usados."""
-    names = {os.path.splitext(os.path.basename(ch.title))[0] for ch in chunks}
-    return sorted(names)
+def _guess_year(pages: List[str]) -> str | None:
+    # tenta ano no front-matter
+    head = "\n".join(pages[:2])
+    m = re.search(r"\b(20\d{2}[a-z]?|19\d{2}[a-z]?)\b", head)
+    if m:
+        return m.group(1)
+    # tenta nas últimas páginas (rodapés / refs)
+    tail = "\n".join(pages[-2:]) if len(pages) > 2 else ""
+    m2 = re.search(r"\b(20\d{2}[a-z]?|19\d{2}[a-z]?)\b", tail)
+    return m2.group(1) if m2 else None
 
+def _guess_first_author_surname(pages: List[str]) -> str | None:
+    head = "\n".join(pages[:2])
+    lines = [ln.strip() for ln in head.splitlines() if ln.strip()]
+    # linha com vírgulas / and / & e palavras em Title Case
+    for ln in lines:
+        if ("," in ln or " and " in ln or " & " in ln) and len(ln) < 200:
+            parts = re.split(r",| and | & ", ln)
+            for p in parts:
+                toks = p.strip().split()
+                if len(toks) >= 1:
+                    last = toks[-1]
+                    if last[:1].isupper() and last.isalpha() and len(last) >= 2:
+                        return last
+    # fallback: "By Nome Sobrenome"
+    m = re.search(r"\bby\s+([A-Z][A-Za-z\-']+)\s+([A-Z][A-Za-z\-']+)", head, flags=re.I)
+    if m:
+        return m.group(2)
+    return None
+
+def build_doc_citation_key(pages: List[str], filename_stem: str) -> str:
+    """Gera label estilo Huang2021; fallbacks: PrimeiraPalavraTítulo+Ano; senão filename."""
+    first_author = _guess_first_author_surname(pages)
+    year = _guess_year(pages)
+    if first_author and year:
+        return f"{first_author}{year}"
+    title_line = next((ln.strip() for ln in pages[0].splitlines() if ln.strip()), "")
+    first_word = title_line.split()[0] if title_line else None
+    if first_word and year and first_word[:1].isalpha():
+        return f"{first_word}{year}"
+    return filename_stem
+
+# ===== Citação e lista de arquivos =====
+
+def build_citation(ch: "Chunk") -> str:
+    """Usa a chave autor-ano inferida por doc_id + número de página."""
+    label = st.session_state.doc_labels.get(ch.doc_id) if "doc_labels" in st.session_state else None
+    if not label:
+        label = os.path.splitext(os.path.basename(ch.title))[0]
+    return f"[{label}:{ch.page_start+1}]"
+
+def files_used_from_chunks(chunks: List["Chunk"]) -> List[Tuple[str, str]]:
+    """Retorna pares (LabelAutorAno, NomeArquivoSemExtensão)."""
+    pairs = set()
+    for ch in chunks:
+        label = st.session_state.doc_labels.get(ch.doc_id) if "doc_labels" in st.session_state else None
+        if not label:
+            label = os.path.splitext(os.path.basename(ch.title))[0]
+        stem = os.path.splitext(os.path.basename(ch.title))[0]
+        pairs.add((label, stem))
+    return sorted(pairs)
 
 # =========================
 # Chunking e índice vetorial
@@ -153,7 +205,10 @@ class VectorIndex:
             self.vectors = embs
         else:
             import numpy as np
-            self.vectors = np.vstack([self.vectors, embs])
+            self.vectors = __import__("numpy").vstack([self.vectors, embs]) if hasattr(__import__("numpy"), "vstack") else None  # fallback
+            if self.vectors is None:
+                import numpy as np
+                self.vectors = np.vstack([self.vectors, embs])  # noqa
         self.meta.extend(chunks)
         self.index.add(embs)
 
@@ -167,12 +222,21 @@ class VectorIndex:
             results.append((self.meta[idx], float(score)))
         return results
 
-def diversify_by_doc(
+# =========================
+# Seleção focada em COBERTURA + RIQUEZA
+# =========================
+
+def select_for_coverage_and_richness(
     hits: List[Tuple[Chunk, float]],
-    per_doc: int = 3,
-    max_total: int = 12
+    min_per_doc: int,
+    max_per_doc: int,
+    max_total: int
 ) -> List[Chunk]:
-    """Round-robin por documento: limita nº de chunks por paper e total."""
+    """
+    1) Garante cobertura: tenta pegar pelo menos 'min_per_doc' chunks de cada documento presente nos top-k.
+    2) Depois preenche até 'max_total' usando os melhores restantes, sem estourar 'max_per_doc' por doc.
+    Objetivo: maximizar diversidade de fontes (texto rico) sem perder qualidade global.
+    """
     bydoc: Dict[str, List[Tuple[Chunk, float]]] = {}
     for ch, sc in hits:
         bydoc.setdefault(ch.doc_id, []).append((ch, sc))
@@ -180,52 +244,68 @@ def diversify_by_doc(
         bydoc[d].sort(key=lambda x: x[1], reverse=True)
 
     out: List[Chunk] = []
-    round_i = 0
-    while len(out) < max_total:
-        added = 0
-        for d in sorted(bydoc.keys()):
-            if round_i < len(bydoc[d]) and round_i < per_doc:
-                out.append(bydoc[d][round_i][0])
-                added += 1
-                if len(out) >= max_total:
-                    break
-        if added == 0:
+    count_by_doc: Dict[str, int] = {}
+
+    # Passo A: cobertura mínima por doc
+    for doc_id, arr in bydoc.items():
+        take = min(min_per_doc, len(arr))
+        for i in range(take):
+            if len(out) >= max_total:
+                break
+            out.append(arr[i][0])
+            count_by_doc[doc_id] = count_by_doc.get(doc_id, 0) + 1
+        if len(out) >= max_total:
             break
-        round_i += 1
+
+    if len(out) >= max_total:
+        return out
+
+    # Passo B: enriquece com melhores restantes respeitando max_per_doc
+    remaining = []
+    for doc_id, arr in bydoc.items():
+        remaining.extend([(doc_id, ch, sc) for ch, sc in arr[min_per_doc:]])
+    remaining.sort(key=lambda t: t[2], reverse=True)
+
+    for doc_id, ch, sc in remaining:
+        if len(out) >= max_total:
+            break
+        if count_by_doc.get(doc_id, 0) >= max_per_doc:
+            continue
+        out.append(ch)
+        count_by_doc[doc_id] = count_by_doc.get(doc_id, 0) + 1
+
     return out
 
-
 # =========================
-# Prompt — revisão narrativa
+# Prompt — revisão narrativa (maximiza citações)
 # =========================
 
-def make_prompt(theme: str, selected: List[Chunk]) -> str:
+def make_prompt(theme: str, selected: List[Chunk], min_cites_per_paragraph: int = 2) -> str:
     """
-    Prompt para revisão narrativa coesa, citando somente os PDFs enviados.
-    Citações no corpo: (arquivo:pag). Sem autores/APA. Prosa contínua (sem bullets).
+    Prosa coesa, **sem bullets**, citando com frequência no formato (Label:pag) e variando as fontes.
+    Pede citação múltipla por parágrafo quando houver suporte.
     """
     context_blocks = [f"{build_citation(ch)}\n{ch.text}" for ch in selected]
     context = "\n\n".join(context_blocks)
 
     return (
-        "Você é um pesquisador sênior escrevendo uma **revisão de literatura narrativa**.\n"
+        "Você é um pesquisador sênior escrevendo uma revisão de literatura **narrativa**.\n"
         "Responda **somente** com base nos trechos fornecidos; não use fontes externas.\n"
         "Escreva em **prosa contínua**, acadêmica e coesa, **sem listas ou bullets**.\n"
-        "Use **conectivos e transições** para encadear ideias entre parágrafos (por exemplo: "
-        "'em síntese', 'por outro lado', 'em consonância com', 'à luz desses achados').\n"
-        "As citações devem aparecer **no corpo do texto** no formato **(arquivo:pag)** — ex.: (Smith2020:12). "
-        "Não cite autores/anos; **apenas** o nome do arquivo e a página.\n\n"
+        f"Use muitas citações internas, variando as fontes, e insira **pelo menos {min_cites_per_paragraph} citações (Label:pag)** por parágrafo, "
+        "sempre que houver suporte no material. Evite depender de um único documento.\n"
+        "As citações aparecem **no corpo do texto** como **(Label:pag)** — ex.: (Huang2021:12). "
+        "NÃO cite autores/anos fora desse formato; NÃO invente referências.\n\n"
         f"TEMA: {theme}\n\n"
-        "=== TRECHOS DISPONÍVEIS (com [arquivo:pag]) ===\n"
+        "=== TRECHOS DISPONÍVEIS (com [Label:pag]) ===\n"
         f"{context}\n\n"
         "=== PRODUZIR ===\n"
-        "Um texto em português com 700–1100 palavras, em parágrafos fluentes (sem tópicos), que:\n"
+        "Um texto em português, com 900–1300 palavras, em parágrafos fluentes (sem tópicos), que:\n"
         "• introduz o tema e a relevância;\n"
-        "• encadeia argumentos, comparando convergências e divergências entre os trechos;\n"
+        "• encadeia argumentos com **muitas citações (Label:pag)**, comparando convergências e divergências;\n"
         "• aponta limitações e oportunidades futuras;\n"
-        "• emprega citações (arquivo:pag) no corpo quando apropriado.\n"
+        "• evita generalizações sem suporte; quando não houver evidência suficiente, sinalize explicitamente.\n"
     )
-
 
 # =========================
 # Chamadas LLM
@@ -241,7 +321,7 @@ def call_openai(prompt: str, model_name: str = "gpt-4o-mini") -> str:
                 {"role": "system", "content": "Você é um assistente de revisão acadêmica e deve se ater estritamente ao RAG fornecido."},
                 {"role": "user", "content": prompt},
             ],
-            temperature=0.4,
+            temperature=0.35,
         )
         return resp.choices[0].message.content
     except Exception as e:
@@ -293,33 +373,32 @@ def call_gemini(prompt: str, model_name: str = "gemini-1.5-flash") -> str:
         st.error(f"Erro ao chamar o Gemini: {e}")
         return "Falha ao gerar revisão com Gemini."
 
-
 # =========================
 # Fallback sem LLM
 # =========================
 
 def extractive_review(theme: str, selected: List[Chunk]) -> str:
-    """Fallback simples: concatena trechos com marcação (arquivo:pag)."""
+    """Fallback simples: concatena trechos com marcação (Label:pag)."""
     lines = [f"Revisão (extrativa) — {theme}"]
     for ch in selected:
-        lines.append(f"{ch.text.strip()} ({os.path.splitext(os.path.basename(ch.title))[0]}:{ch.page_start+1})")
+        label = st.session_state.doc_labels.get(ch.doc_id) if "doc_labels" in st.session_state else os.path.splitext(os.path.basename(ch.title))[0]
+        lines.append(f"{ch.text.strip()} ({label}:{ch.page_start+1})")
     return "\n\n".join(lines)
-
 
 # =========================
 # Exportação
 # =========================
 
-def to_markdown(theme: str, body: str, used_files: List[str]) -> str:
-    used = "\n".join(f"- {u}" for u in used_files)
+def to_markdown(theme: str, body: str, used_files: List[Tuple[str, str]]) -> str:
+    used = "\n".join(f"- {label} → {stem}" for label, stem in used_files)
     return (
         f"# Revisão de Literatura — {theme}\n\n"
         + body
-        + "\n\n## Arquivos utilizados\n"
+        + "\n\n## Arquivos utilizados (Label → Arquivo)\n"
         + (used if used else "*Nenhum*")
     )
 
-def to_docx(theme: str, body_text: str, used_files: List[str]) -> bytes:
+def to_docx(theme: str, body_text: str, used_files: List[Tuple[str, str]]) -> bytes:
     doc = Document()
     doc.add_heading(f"Revisão de Literatura — {theme}", level=0)
     for para in body_text.split("\n\n"):
@@ -328,33 +407,37 @@ def to_docx(theme: str, body_text: str, used_files: List[str]) -> bytes:
             doc.add_paragraph("")
         else:
             doc.add_paragraph(p)
-    doc.add_heading("Arquivos utilizados", level=1)
-    for f in used_files:
-        doc.add_paragraph(f"- {f}")
+    doc.add_heading("Arquivos utilizados (Label → Arquivo)", level=1)
+    for label, stem in used_files:
+        doc.add_paragraph(f"- {label} → {stem}")
     bio = io.BytesIO()
     doc.save(bio)
     return bio.getvalue()
-
 
 # =========================
 # UI — Streamlit
 # =========================
 
-st.set_page_config(page_title="RAG Review — Revisão narrativa", layout="wide")
-st.title("RAG para Revisão Narrativa — múltiplos PDFs ➜ texto coeso com (arquivo:pag)")
+st.set_page_config(page_title="RAG Review — Revisão narrativa (rica em citações)", layout="wide")
+st.title("RAG para Revisão Narrativa — múltiplos PDFs ➜ texto coeso com (Label:pag) e muitas citações")
 
 with st.sidebar:
     st.header("Parâmetros")
     chunk_size = st.number_input(
         "Tamanho do chunk (aprox. palavras)",
-        min_value=400, max_value=3000, value=int(os.getenv("CHUNK_SIZE", "1200")), step=100
+        min_value=400, max_value=4000, value=int(os.getenv("CHUNK_SIZE", "1200")), step=100
     )
     overlap = st.number_input(
-        "Sobreposição", min_value=0, max_value=800, value=int(os.getenv("CHUNK_OVERLAP", "200")), step=50
+        "Sobreposição", min_value=0, max_value=1000, value=int(os.getenv("CHUNK_OVERLAP", "200")), step=50
     )
-    topk = st.slider("Top-K inicial (busca)", 5, 100, 30, step=5)
-    per_doc = st.slider("Diversidade por documento (máx. chunks)", 1, 10, 3, step=1)
-    max_total = st.slider("Máximo total de chunks no prompt", 5, 30, 12, step=1)
+
+    st.markdown("— **Cobertura & Riqueza de citações** —")
+    # valores pensados para maximizar evidências usando muitos PDFs
+    topk = st.slider("Top-K (busca inicial)", 10, 200, 80, step=10)
+    min_per_doc = st.slider("Mínimo por documento", 1, 5, 2, step=1)
+    max_per_doc = st.slider("Máximo por documento", 2, 8, 4, step=1)
+    max_total = st.slider("Máximo total de chunks no prompt", 8, 40, 18, step=1)
+    min_cites_per_paragraph = st.slider("Citações mínimas por parágrafo", 1, 4, 2, step=1)
 
     st.subheader("Provedor LLM")
     provider = st.selectbox(
@@ -385,51 +468,65 @@ col1, col2 = st.columns([2, 1])
 with col1:
     theme = st.text_area(
         "Tema / pergunta de pesquisa",
-        placeholder="ex.: Impacto de IA generativa na percepção de autenticidade de marcas"
+        placeholder="ex.: IA generativa e autenticidade de marca no marketing"
     )
 with col2:
     run_btn = st.button("Gerar revisão", type="primary")
 
-# Estado
+# ===== Estado =====
 if "vector" not in st.session_state:
     st.session_state.vector = None
 if "mapping" not in st.session_state:
     st.session_state.mapping = {}
 if "chunks" not in st.session_state:
     st.session_state.chunks: List[Chunk] = []
+if "doc_labels" not in st.session_state:
+    st.session_state.doc_labels: Dict[str, str] = {}
 
-# Ingestão a partir dos uploads
+# ===== Ingestão a partir dos uploads (com labels Autor-Ano) =====
 if uploaded and st.session_state.vector is None:
-    with st.spinner("Processando PDFs e criando índice..."):
+    with st.spinner("Processando PDFs, inferindo labels e criando índice..."):
         vec = VectorIndex()
         mapping: Dict[str, str] = {}
         all_chunks: List[Chunk] = []
+
         for i, uf in enumerate(uploaded):
             raw = uf.read()
             pages, title = read_pdf(raw)
+            filename_stem = os.path.splitext(os.path.basename(title))[0]
+            label = build_doc_citation_key(pages, filename_stem)
+
             doc_id = f"doc{i+1}"
-            mapping[os.path.splitext(title)[0]] = title
+            st.session_state.doc_labels[doc_id] = label
+            mapping[filename_stem] = title
+
             cs = chunk_pages(
                 pages, title=title, doc_id=doc_id,
                 chunk_size=int(chunk_size), overlap=int(overlap)
             )
             all_chunks.extend(cs)
+
         vec.add(all_chunks)
         st.session_state.vector = vec
         st.session_state.mapping = mapping
         st.session_state.chunks = all_chunks
     st.success(f"Indexados {len(st.session_state.chunks)} trechos de {len(uploaded)} PDFs.")
 
-# Execução
+# ===== Execução =====
 if run_btn:
     if not theme.strip():
         st.warning("Informe um tema/pergunta de pesquisa.")
     elif st.session_state.vector is None:
         st.warning("Envie os PDFs antes.")
     else:
-        with st.spinner("Buscando e sintetizando..."):
+        with st.spinner("Buscando e sintetizando com máxima cobertura de fontes..."):
             hits = st.session_state.vector.search(theme, k=int(topk))
-            selected = diversify_by_doc(hits, per_doc=int(per_doc), max_total=int(max_total))
+            selected = select_for_coverage_and_richness(
+                hits,
+                min_per_doc=int(min_per_doc),
+                max_per_doc=int(max_per_doc),
+                max_total=int(max_total)
+            )
 
             # Auditoria opcional dos trechos
             with st.expander("Trechos selecionados (auditoria)"):
@@ -438,7 +535,7 @@ if run_btn:
                     st.write(ch.text)
                     st.divider()
 
-            prompt = make_prompt(theme, selected)
+            prompt = make_prompt(theme, selected, min_cites_per_paragraph=int(min_cites_per_paragraph))
 
             # Provedor
             body_text = ""
@@ -461,9 +558,9 @@ if run_btn:
             st.markdown("### Revisão gerada")
             st.write(body_text)
 
-            st.markdown("### Arquivos utilizados")
-            for f in used_files:
-                st.write(f"- {f}")
+            st.markdown("### Arquivos utilizados (Label → Arquivo)")
+            for label, stem in used_files:
+                st.write(f"- **{label}** → {stem}")
 
             # Exportação
             st.markdown("---")
@@ -490,11 +587,11 @@ st.markdown(
     """
 ---
 **Observações**
-- O texto é narrativo e coeso; as citações aparecem no corpo como (arquivo:pag).
-- A seção final “Arquivos utilizados” serve para você montar as referências manualmente.
-- Se os PDFs forem escaneados sem texto, rode OCR (ex.: Tesseract/ocrmypdf) antes.
+- O texto é narrativo, com **muitas citações** no corpo no formato (Label:pag), priorizando **diversidade de fontes**.
+- A lista “Arquivos utilizados (Label → Arquivo)” ajuda você a montar as referências. Sem APA automática.
+- Para textos ainda mais ricos, aumente `Top-K`, `Mínimo por documento` e/ou `Máximo total de chunks`.
+- Se PDFs forem scaneados sem texto, rode OCR (ex.: Tesseract/ocrmypdf) antes.
 """
 )
-
 
 
